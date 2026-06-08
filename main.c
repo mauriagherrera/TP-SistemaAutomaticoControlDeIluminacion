@@ -1,5 +1,6 @@
 /*
- Sistema Automatico de Control de Iluminacion de un Ambiente
+ ----------------- Sistema Automatico de Control de Iluminacion de un Ambiente  -----------------
+
 Descripcion:
 - ADC (canal 0, P0.23): digitaliza señal del sensor TEMT6000        		  Cable blanco
 - GPDMA (canal 0): almacena automaticamente las conversiones ADC
