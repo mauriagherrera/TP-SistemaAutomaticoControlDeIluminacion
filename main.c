@@ -15,7 +15,7 @@ Logica del sistema:
 
 1. El ADC muestrea el sensor de luz cada 1ms (1 kHz)
 2. El DMA almacena BUFFER_TAM muestras en SRAM
-3. Al completar el bloque, el ISR del DMA calcula el promedio
+3. Al completar el bloque, el ISR del DMA calcula el promedio - 64 ms
 4. Se calcula el porcentaje de luz ambiente respecto al maximo calibrado
 5. Se calcula el error = porcentaje deseado - porcentaje medido
 6. El error se convierte en duty PWM (Timer1) y voltaje DAC
@@ -35,8 +35,8 @@ CCLK = 100 MHz, PCLK = 25 MHz
 #include "lpc17xx_gpdma.h"
 #include "lpc17xx_dac.h"
 #include "lpc17xx_uart.h"
-#include <string.h>
-#include <stdint.h>
+#include <string.h>                 //para manejar cadenas de caracteres, ej strlen()
+#include <stdint.h>                 // para variables de tipo entero con tam fijo 
 
 // ===== Defines =====
 #define BUFFER_ADC_ADDR 0x2007C000
@@ -46,10 +46,10 @@ CCLK = 100 MHz, PCLK = 25 MHz
 #define RX_BUFFER_SIZE 16
 
 #define TIM1_PERIODO 4999	        // cada tick 1uS, = 5 mS de periodo PWM
-#define ERROR_ZONA_MUERTA 2		    // error deseado para evitar que funcionen mal los leds cerca del valor deseado
+#define ERROR_ZONA_MUERTA 2		    // para evitar que funcionen mal los leds cerca del valor deseado
 
-#define LUX_MAXIMO 776              // lux correspondientes al 100%
-#define MV_MAXIMO 3133              // mV correspondientes al 100% del ADC
+#define LUX_MAXIMO 776              // lux correspondientes al 100% del foco
+#define MV_MAXIMO 3133              // mV correspondientes al 100% 
 
 
 // ===== Variables globales =====
@@ -60,8 +60,8 @@ volatile uint16_t adc_promedio = 0;
 volatile uint8_t  porcentaje_deseado = 50;
 volatile uint8_t  porcentaje_ambiente = 0;
 volatile int16_t  error_luz = 0;
-volatile uint8_t  duty_pwm = 0;
-volatile uint8_t  duty_pwm_pendiente = 0;		// valor del duty que separa del calculado por el DMA, del valor ya en el timer para evitar errores
+volatile uint8_t  duty_pwm = 0;                 // duty aplicado en el mr1, se actualiza dentro del timer1 handler (el del pwm), en la int de mr0 para evitar cambiar el duty a mitad de ciclo
+volatile uint8_t  duty_pwm_pendiente = 0;		// valor del duty q esta esperando a ser aplicado, no necesariamente esta activo, no actualiza el mr1
 
 volatile uint16_t lux_ambiente = 0;
 volatile uint16_t mv_ambiente = 0;
@@ -72,9 +72,9 @@ volatile uint8_t  enviar_estado = 0;
 volatile uint8_t  aviso_arranque = 0;			// flag para el mensaje de UART
 volatile uint32_t contador_2_segundos = 0;
 
-volatile char rx_buffer[RX_BUFFER_SIZE];
-volatile uint8_t  rx_index = 0;
-volatile uint8_t  comando_listo  = 0;
+volatile char rx_buffer[RX_BUFFER_SIZE];        // buffer para guardar los caracteres ingresados 
+volatile uint8_t  rx_index = 0;                 // index para el buffer 
+volatile uint8_t  comando_listo  = 0;           // flag que indica si ya esta el comando listo para procesar
 
 
 // ==== Funciones ====
@@ -101,8 +101,57 @@ void UART_ProcesarComando(void);
 void UART_EnviarEstado(void);
 uint8_t convertirTextoAPorcentaje(volatile char *str);
 
+void TIMER1_IRQHandler(void);
+void DMA_IRQHandler(void);
+void EINT0_IRQHandler(void);
+void UART1_IRQHandler(void);
 
-// Convierte los mV a porcentaje de luz
+
+// ===== MAIN =====
+int main(void) {
+    SystemCoreClockUpdate();						// actualiza frecuencia real a la que esta el procesador (100MHz)
+    SysTick_Config(SystemCoreClock / 1000);			// config Systick para 1mS (100M/1000=100k -> 1ms)
+
+    confPin();
+    configDAC();
+    configADC();
+    configDMA();
+    configTIM0();
+    confTim1();
+    configUART1();
+
+    // inicializar el valor deseado
+    mv_deseado = porcentaje_a_mv(porcentaje_deseado); 								// se inicia con un porc deseado = 50%
+
+    lux_deseado = (uint16_t)(((uint32_t)mv_deseado * LUX_MAXIMO) / MV_MAXIMO);		// regla de 3 simples para calcular el lux
+
+    UART_SendString("=== Sistema de Control de Iluminacion ===\r\n");
+    UART_SendString("Presione EINT0 para arrancar el sistema\r\n");
+    UART_SendString("Ingrese porcentaje deseado (0-100) via UART:\r\n");
+
+    while (1) {														// bucle que se encarga del envio del UART segun alguna flag
+        if (comando_listo) {
+            UART_ProcesarComando();
+            continue;                                           //me salteo el resto 
+        }   
+
+        if (aviso_arranque == 1) {
+            aviso_arranque = 0;
+            UART_SendString("\r\n[SISTEMA ARRANCADO]\r\n");
+        } else if (aviso_arranque == 2) {
+            aviso_arranque = 0;
+            UART_SendString("\r\n[SISTEMA DETENIDO]\r\n");
+        }
+
+        if (enviar_estado) {
+            enviar_estado = 0;
+            UART_EnviarEstado();
+        }
+    }
+    return 0;
+}
+
+// Convierte los mV a porcentaje de luz                     % = %inicial + ((mV - mv_inicial) * dif%) / dif_mV
 uint8_t mv_a_porcentaje(uint16_t mv) {
     if (mv == 0) return 0;
 
@@ -127,7 +176,7 @@ uint8_t mv_a_porcentaje(uint16_t mv) {
     return 100; 	// saturación absoluta
 }
 
-// Convierte porcentaje deseado a mV objetivo
+// Convierte porcentaje deseado a mV objetivo                       mv = mv_inicial + ((% - %inicial) * dif_mv) / dif%
 uint16_t porcentaje_a_mv(uint8_t pct) {
     if (pct == 0) return 0;
     if (pct <= 1) return (uint16_t)((pct * 425) / 1);
@@ -139,7 +188,8 @@ uint16_t porcentaje_a_mv(uint8_t pct) {
     return 3133;
 }
 
-// temporizador de 2 segundos para UART1 
+
+// ==== temporizador de 2 segundos para UART1 ====
 
 void SysTick_Handler(void) {
     contador_2_segundos++;
@@ -149,50 +199,6 @@ void SysTick_Handler(void) {
     }
 }
 
-
-// ===== MAIN =====
-int main(void) {
-    SystemCoreClockUpdate();						// configurar a la frecuencia real a la que esta el procesador (100MHz)
-    SysTick_Config(SystemCoreClock / 1000);			// config Systick para 1mS
-
-    confPin();
-    configDAC();
-    configADC();
-    configDMA();
-    configTIM0();
-    confTim1();
-    configUART1();
-
-    // inicializar el valor deseado
-    mv_deseado = porcentaje_a_mv(porcentaje_deseado); 								// se inicia con un porc deseado = 50%
-
-    lux_deseado = (uint16_t)(((uint32_t)mv_deseado * LUX_MAXIMO) / MV_MAXIMO);		// regla de 3 simples para calcular el lux
-
-    UART_SendString("=== Sistema de Control de Iluminacion ===\r\n");
-    UART_SendString("Presione EINT0 para arrancar el sistema\r\n");
-    UART_SendString("Ingrese porcentaje deseado (0-100) via UART:\r\n");
-
-    while (1) {														// bucle que se encarga del envio del UART segun alguna flag
-        if (comando_listo) {
-            UART_ProcesarComando();
-            continue;
-        }
-
-        if (aviso_arranque == 1) {
-            aviso_arranque = 0;
-            UART_SendString("\r\n[SISTEMA ARRANCADO]\r\n");
-        } else if (aviso_arranque == 2) {
-            aviso_arranque = 0;
-            UART_SendString("\r\n[SISTEMA DETENIDO]\r\n");
-        }
-
-        if (enviar_estado) {
-            enviar_estado = 0;
-            UART_EnviarEstado();
-        }
-    }
-    return 0;
-}
 
 
 // ===== Config Pines y EINT0 =====
@@ -345,8 +351,8 @@ void confTim1(void) {						//encargado del PWM
 void TIMER1_IRQHandler(void) {
     if (TIM_GetIntStatus(LPC_TIM1, TIM_MR0_INT) == SET) {
         if (duty_pwm != duty_pwm_pendiente) {					//verifica si hay nuevo valor del duty calculado por el DMA
-            duty_pwm = duty_pwm_pendiente;
-            PWM_AplicarDuty(duty_pwm);
+            duty_pwm = duty_pwm_pendiente;                      // se va a cambiar el mr1 al inicio del pwm (en mr0)
+            PWM_AplicarDuty(duty_pwm);                          // actualiza el mr1 
         }
 
         if (sistema_activo && duty_pwm > 0)
@@ -376,12 +382,12 @@ void DMA_IRQHandler(void) {
     }
 }
 
-void procesarBloqueDMA(void) {
-    volatile uint32_t *buf = (volatile uint32_t *)BUFFER_ADC_ADDR;		//direccion de los datos del ADC
-    uint32_t suma = 0;
+void procesarBloqueDMA(void) {                                  //calcula nuevo valor de adc, actualiza los demas valores en base a eso, actualiza el dac
+    volatile uint32_t *buf = (volatile uint32_t *)BUFFER_ADC_ADDR;		//puntero para recorrer y hacer el promedio
+    uint32_t suma = 0;                  
     uint32_t i;
     uint32_t dac_valor;
-    uint8_t nuevo_duty;
+    uint8_t nuevo_duty;                                                   // nuevo duty medido y calculado
 
     for (i=0; i< BUFFER_TAM; i++) {
         suma += (buf[i] >> 4) & 0xFFF;									// suma los datos del ADC para luego sacar el promedio
@@ -389,7 +395,7 @@ void procesarBloqueDMA(void) {
     adc_promedio = (uint16_t)(suma / BUFFER_TAM);						//suma / 64
 
     // calculo directo de los mV leidos por el sensor
-    mv_ambiente = (uint16_t)(((uint32_t)adc_promedio * 3300) / 4095);
+    mv_ambiente = (uint16_t)(((uint32_t)adc_promedio * 3300) / 4095);       // hace los calculos para los nuevos valores con el nuevo valor del adc
 
     // conversion lineal de mV: a Lux Físicos (Para el UART)
     lux_ambiente = (uint16_t)(((uint32_t)mv_ambiente * LUX_MAXIMO) / MV_MAXIMO);
@@ -402,7 +408,7 @@ void procesarBloqueDMA(void) {
 
     if (error_luz <= 0) {											//si el error<=0, signfica mucha luz por lo tanto apago los leds
         nuevo_duty = 0;
-    } else if ((porcentaje_deseado > ERROR_ZONA_MUERTA) &&			//Si el error<2% de error de la zoma muerta, no enciende los leds
+    } else if ((porcentaje_deseado > ERROR_ZONA_MUERTA) &&			//Si el error<2% de error de la zoma muerta, no enciende los leds, y para no anular valores deseados bajos 
                (error_luz <= ERROR_ZONA_MUERTA)) {
         nuevo_duty = 0;
     } else if (error_luz >= 100) {									//si el error>= 100 significa poca luz por lo tanto enciendo
@@ -411,7 +417,7 @@ void procesarBloqueDMA(void) {
         nuevo_duty = (uint8_t)error_luz;
     }
 
-    if (nuevo_duty != duty_pwm_pendiente) {							// solo actualiza el duty si cambio, para evitar sobreescribir el match
+    if (nuevo_duty != duty_pwm_pendiente) {							// solo actualiza el duty si cambio pendiente, para evitar sobreescribir el match
         PWM_SetDuty(nuevo_duty);
     }
 
@@ -482,12 +488,12 @@ void PWM_SetDuty(uint8_t duty) {
     duty_pwm_pendiente = duty;					//solo escribe la variable sin tocar el timer
 }
 
-void PWM_AplicarDuty(uint8_t duty) {			//calcula a partir del duty la cantidad de ticks para actualizar el match variable
+void PWM_AplicarDuty(uint8_t duty) {			//calcula tick y actualiza el mr1
     uint32_t ticks;
     if (duty == 0) {											//Min
         TIM_UpdateMatchValue(LPC_TIM1, TIM_MATCH_1, 1);
     } else if (duty >= 100) {									//Max
-        TIM_UpdateMatchValue(LPC_TIM1, TIM_MATCH_1, TIM1_PERIODO + 1);
+        TIM_UpdateMatchValue(LPC_TIM1, TIM_MATCH_1, TIM1_PERIODO + 1);          // queda fuera del periodo y el pin no baja
     } else {
         ticks = ((uint32_t)(TIM1_PERIODO + 1) * duty) / 100;
         if (ticks == 0)            ticks = 1;					//para no tener ticks = 0
@@ -501,40 +507,43 @@ void PWM_AplicarDuty(uint8_t duty) {			//calcula a partir del duty la cantidad d
 
 void configUART1(void) {
     UART_CFG_T uartCfg = {
-        .baudRate = 115200,								//esta cantidad de baud rate para que sean mas rapidos el envio de caracteres y evitar bloqueos
+        .baudRate = 115200,								//velocidad de transmision, mas rapidos el envio de caracteres y evitar bloqueos
         .dataBits = UART_DBITS_8,
         .stopBits = UART_STOPBIT_1,
         .parity = UART_PARITY_NONE					//envio de 8 bits por paquete, con 1 bit de parada para setear el fin de cada caracter
     };													//sin bit de paridad para no comprobar si hay errores
     UART_FIFO_CFG_T fifoCfg = {
-        .level = UART_FIFO_TRGLEV0,				    //interrupcion apenas llega 1 byte
-        .resetRxBuf = ENABLE,
-        .resetTxBuf = ENABLE,
-        .dmaMode = DISABLE
+        .level = UART_FIFO_TRGLEV0,				    //trigger level 0: interrumpe cuando llega 1 caracter
+        .resetRxBuf = ENABLE,                       // enable limpioa fifo de recepcion
+        .resetTxBuf = ENABLE,                       //enable limpia fifo de transmision
+        .dmaMode = DISABLE                          // no usamos dma
     };
 
     UART_PinConfig(UART_TX1_P0_15);
     UART_PinConfig(UART_RX1_P0_16);
-    UART_Init(UART_PC, &uartCfg);
+    UART_Init(UART_PC, &uartCfg);                   // powerup, calcula divisores, configura y limpia estados viejos    
     UART_FIFOConfig(UART_PC, &fifoCfg);
     UART_TxEnable(UART_PC);
-    UART_IntConfig(UART_PC, UART_INT_RBR, ENABLE);
-    UART_IntConfig(UART_PC, UART_INT_RLS, ENABLE);
+    UART_IntConfig(UART_PC, UART_INT_RBR, ENABLE);      //habilito int cuando hay dato recibido en la fifo rx
+    UART_IntConfig(UART_PC, UART_INT_RLS, ENABLE);      //habilito int por error o estado de linea 
     NVIC_SetPriority(UART1_IRQn, 0);
     NVIC_EnableIRQ(UART1_IRQn);
 }
 
-void UART1_IRQHandler(void) {
-    uint32_t intId = UART_GetIntId(UART_PC);			//Id de la interrupcion del uart
+
+// ==== Para Recepcion ====
+
+void UART1_IRQHandler(void) {                           // para recepcion
+    uint32_t intId = UART_GetIntId(UART_PC);			//Id de la interrupcion del uart, lee el IIR 
     uint32_t tipo_int;
     uint8_t estado;
     uint8_t dato;
     uint8_t leidos = 0;
 
-    if (intId & UART_IIR_INTSTAT_PEND) return;			// = 1 si se entro al handler por algun rebote y se vuelve, = 0 si no fue error y pasa al codigo
+    if (intId & UART_IIR_INTSTAT_PEND) return;			// = 1 no hay int pendiente, = 0 si hay int pendiente 
 
-    tipo_int = intId & UART_IIR_INTID_MASK;
-    estado = UART_GetLineStatus(UART_PC);
+    tipo_int = intId & UART_IIR_INTID_MASK;             //se queda con los bits que le dicen la causa de la int     
+    estado = UART_GetLineStatus(UART_PC);               //lee el LSR, contiene flags 
 
     if (tipo_int == UART_IIR_INTID_RLS) {				//si fue int de error de linea se limpia los buffer de rx si no habia comando para procesar
         if (!comando_listo) {							//y se limpia la FIFO en el while
@@ -543,7 +552,7 @@ void UART1_IRQHandler(void) {
         }
 
         while ((leidos < RX_BUFFER_SIZE) && (UART_Receive(UART_PC, &dato, 1, NONE_BLOCKING) == 1)) {	//se usa el NONE_BLOCKING para no bloquear
-            leidos++;																		//mientras haya datos en el FIFO
+            leidos++;																		//mientras haya datos en el FIFO, los limpia leyendolos 
         }
         return;
     }
@@ -557,12 +566,12 @@ void UART1_IRQHandler(void) {
         while ((leidos < RX_BUFFER_SIZE) && (UART_Receive(UART_PC, &dato, 1, NONE_BLOCKING) == 1)) {		//limpia la FIFO si hubo error
             leidos++;
 
-            if (comando_listo) {			//para evitar errores de bloqueo y de sobreponer al mandar un caracter mientras se vacia la FIFO
-                continue;
+            if (comando_listo) {			
+                continue;                               //para no agregar nuevos caracteres si ya hay un comanod listo para procesar 
             }
 
             if (dato == '\r' || dato == '\n') {		//detecta el enter del teclado y activa la flag de comando listo
-                if (rx_index > 0) {
+                if (rx_index > 0) {                 //si tiene al menos un caracter cierra el string
                     rx_buffer[rx_index] = '\0';
                     rx_index = 0;
                     comando_listo = 1;
@@ -582,7 +591,7 @@ void UART1_IRQHandler(void) {
                     rx_buffer[rx_index] = '\0';
                 } else {
                     rx_index     = 0;
-                    rx_buffer[0] = '\0';
+                    rx_buffer[0] = '\0';            //si se llena reinicio
                 }
             }
         }
@@ -590,28 +599,28 @@ void UART1_IRQHandler(void) {
 }
 
 
-// ===== Funciones para el envio de datos UART =====
+// ===== Funciones para la transmision UART =====
 
 void UART_SendString(const char *str) {				//encargado del envio del texto, Blocking = bloqueo hasta que se termine de enviar
-    UART_Send(UART_PC, (uint8_t *)str, strlen(str), BLOCKING);
+    UART_Send(UART_PC, (uint8_t *)str, strlen(str), BLOCKING);      //str texto a enviar, strlen cuenta caracteres a enviar
 }
 
 void UART_SendUInt(uint32_t num) {					//encargado de transformar los caracteres en numero entero y enviarlos
     char buf[11];
     int8_t i = 0, j;
     if (num == 0) {
-        UART_Send(UART_PC, (uint8_t *)"0", 1, BLOCKING);
+        UART_Send(UART_PC, (uint8_t *)"0", 1, BLOCKING);        //manda 0
         return;
     }
     while (num > 0 && i < 10) {
-        buf[i++] = (char)((num % 10) + '0');
+        buf[i++] = (char)((num % 10) + '0');                // guarda los digitos de a 1 
         num /= 10;
     }
     for (j=i-1; j>=0; j--)								//encargado de enviar en orden correcto, por que el while los obtiene en orden al reves
         UART_Send(UART_PC, (uint8_t *)&buf[j], 1, BLOCKING);
 }
 
-void UART_SendInt(int32_t num) {						//encargado de enviar el signo del numero
+void UART_SendInt(int32_t num) {						//encargado de enviar el signo del numero, pq error puede ser negativo
     if (num < 0) {
         UART_Send(UART_PC, (uint8_t *)"-", 1, BLOCKING);
         UART_SendUInt((uint32_t)(-num));
@@ -620,24 +629,27 @@ void UART_SendInt(int32_t num) {						//encargado de enviar el signo del numero
     }
 }
 
-void UART_ProcesarComando(void) {
-    char comando_local[RX_BUFFER_SIZE];
+
+// ==== Funciones para recibir por UART ====
+
+void UART_ProcesarComando(void) {                   //procesa comando recibido y responde ok y el valor o error 
+    char comando_local[RX_BUFFER_SIZE];         //buffer local
     uint8_t nuevo_valor;
     uint8_t i;
 
     NVIC_DisableIRQ(UART1_IRQn);				//se deshabilita la int para copiar el buffer por si llega un caracter de por medio y evitar error
     for (i=0; i< RX_BUFFER_SIZE; i++) {
         comando_local[i] = rx_buffer[i];
-        if (rx_buffer[i] == '\0') break;
+        if (rx_buffer[i] == '\0') break;        //copia el comando 
     }
-    comando_local[RX_BUFFER_SIZE - 1] = '\0';	//comando local tiene los valores del buffer de rx y luego se limpia el buffer de rx
-    rx_buffer[0] = '\0';
+    comando_local[RX_BUFFER_SIZE - 1] = '\0';	//x seguridad 
+    rx_buffer[0] = '\0';                        //limpio el buffer global
     rx_index = 0;
     comando_listo = 0;
-    NVIC_EnableIRQ(UART1_IRQn);
+    NVIC_EnableIRQ(UART1_IRQn);                 //habilito de nuevo para recibir 
 
-    enviar_estado = 0;							//limpio flag del envio de estado que se modifica por el systick
-    contador_2_segundos = 0;					//reseteo el contador de los 2 segundos del systick para que no interrumpa en la mitad
+    enviar_estado = 0;							//limpio flag del systick para q no se mande info mientras proceso 
+    contador_2_segundos = 0;					//reseteo contador para q arranque de nuevo una vez cambiados los valores
 
     nuevo_valor = convertirTextoAPorcentaje(comando_local);		//convierte el codigo ASCII en un entero
 
