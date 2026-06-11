@@ -36,7 +36,7 @@ CCLK = 100 MHz, PCLK = 25 MHz
 #include "lpc17xx_dac.h"
 #include "lpc17xx_uart.h"
 #include <string.h>                 //para manejar cadenas de caracteres, ej strlen()
-#include <stdint.h>                 // para variables de tipo entero con tam fijo 
+#include <stdint.h>                 // para variables de tipo entero con tam fijo
 
 // ===== Defines =====
 #define BUFFER_ADC_ADDR 0x2007C000
@@ -49,7 +49,7 @@ CCLK = 100 MHz, PCLK = 25 MHz
 #define ERROR_ZONA_MUERTA 2		    // para evitar que funcionen mal los leds cerca del valor deseado
 
 #define LUX_MAXIMO 776              // lux correspondientes al 100% del foco
-#define MV_MAXIMO 3133              // mV correspondientes al 100% 
+#define MV_MAXIMO 3133              // mV correspondientes al 100%
 
 
 // ===== Variables globales =====
@@ -72,8 +72,8 @@ volatile uint8_t  enviar_estado = 0;
 volatile uint8_t  aviso_arranque = 0;			// flag para el mensaje de UART
 volatile uint32_t contador_2_segundos = 0;
 
-volatile char rx_buffer[RX_BUFFER_SIZE];        // buffer para guardar los caracteres ingresados 
-volatile uint8_t  rx_index = 0;                 // index para el buffer 
+volatile char rx_buffer[RX_BUFFER_SIZE];        // buffer para guardar los caracteres ingresados
+volatile uint8_t  rx_index = 0;                 // index para el buffer
 volatile uint8_t  comando_listo  = 0;           // flag que indica si ya esta el comando listo para procesar
 
 
@@ -132,8 +132,8 @@ int main(void) {
     while (1) {														// bucle que se encarga del envio del UART segun alguna flag
         if (comando_listo) {
             UART_ProcesarComando();
-            continue;                                           //me salteo el resto 
-        }   
+            continue;                                           //me salteo el resto
+        }
 
         if (aviso_arranque == 1) {
             aviso_arranque = 0;
@@ -153,9 +153,9 @@ int main(void) {
 
 // Convierte los mV a porcentaje de luz                     % = %inicial + ((mV - mv_inicial) * dif%) / dif_mV
 uint8_t mv_a_porcentaje(uint16_t mv) {
-    if (mv == 0) return 0;
+    if (mv <= 200) return 0;
 
-    // tramo 1: cualquier lectura real hasta 425 mV cuenta como 1%
+    // tramo 1: entre 201 y 425 mV cuenta como 1%
     if (mv <= 425) return 1;
 
     // tramo 2: 1% a 20% (425 a 1087 mV) - dif: 662 mV, 19%
@@ -170,8 +170,11 @@ uint8_t mv_a_porcentaje(uint16_t mv) {
     // tramo 5: 50% a 75% (2063 a 2718 mV) - dif: 655 mV, 25%
     if (mv <= 2718) return (uint8_t)(50 + (((mv - 2063) * 25) / 655));
 
-    // tramo 6: 75% a 100% (2718 a 3133 mV) - dif: 415 mV, 25%
-    if (mv <= 3133) return (uint8_t)(75 + (((mv - 2718) * 25) / 415));
+    // tramo 6: 75% a 85% (2718 a 2884 mV) - dif: 166 mV, 10%
+    if (mv <= 2884) return (uint8_t)(75 + (((mv - 2718) * 10) / 166));
+
+    // tramo 7: 85% a 100% (2884 a 3133 mV) - dif: 249 mV, 15%
+    if (mv <= 3133) return (uint8_t)(85 + (((mv - 2884) * 15) / 249));
 
     return 100; 	// saturación absoluta
 }
@@ -184,7 +187,8 @@ uint16_t porcentaje_a_mv(uint8_t pct) {
     if (pct <= 30) return (uint16_t)(1087 + (((pct - 20) * 349) / 10));
     if (pct <= 50) return (uint16_t)(1436 + (((pct - 30) * 627) / 20));
     if (pct <= 75) return (uint16_t)(2063 + (((pct - 50) * 655) / 25));
-    if (pct <= 100) return (uint16_t)(2718 + (((pct - 75) * 415) / 25));
+    if (pct <= 85) return (uint16_t)(2718 + (((pct - 75) * 166) / 10));
+    if (pct <= 100) return (uint16_t)(2884 + (((pct - 85) * 249) / 15));
     return 3133;
 }
 
@@ -272,17 +276,17 @@ void configDMA(void) {
         .dstMemAddr = BUFFER_ADC_ADDR,
         .srcConn = GPDMA_ADC,
         .dstConn  = 0,
-        .src = { 
-            .width = GPDMA_WORD, 
-            .burst = GPDMA_BSIZE_1, 
-            .increment = DISABLE 
+        .src = {
+            .width = GPDMA_WORD,
+            .burst = GPDMA_BSIZE_1,
+            .increment = DISABLE
         },
-        .dst = { 
-            .width = GPDMA_WORD, 
-            .burst = GPDMA_BSIZE_1, 
-            .increment = ENABLE 
+        .dst = {
+            .width = GPDMA_WORD,
+            .burst = GPDMA_BSIZE_1,
+            .increment = ENABLE
         },
-        .intTC = ENABLE,                
+        .intTC = ENABLE,
         .intErr = DISABLE,
         .linkedList = (uint32_t)&lli_adc
     };
@@ -305,7 +309,7 @@ void configTIM0(void) {						//encargado de disparar al ADC
         .channel = TIM_MATCH_1,
         .intEn = DISABLE,
         .stopEn = DISABLE,
-        .resetEn = ENABLE,                      
+        .resetEn = ENABLE,
         .extOpt = TIM_TOGGLE,
         .matchValue = 500 - 1				//flanco cada 500uS, haciendo que haya un flanco de bajada cada 1mS
     };
@@ -352,7 +356,7 @@ void TIMER1_IRQHandler(void) {
     if (TIM_GetIntStatus(LPC_TIM1, TIM_MR0_INT) == SET) {
         if (duty_pwm != duty_pwm_pendiente) {					//verifica si hay nuevo valor del duty calculado por el DMA
             duty_pwm = duty_pwm_pendiente;                      // se va a cambiar el mr1 al inicio del pwm (en mr0)
-            PWM_AplicarDuty(duty_pwm);                          // actualiza el mr1 
+            PWM_AplicarDuty(duty_pwm);                          // actualiza el mr1
         }
 
         if (sistema_activo && duty_pwm > 0)
@@ -370,7 +374,7 @@ void TIMER1_IRQHandler(void) {
 }
 
 
-// ===== Handler DMA ===== 
+// ===== Handler DMA =====
 
 void DMA_IRQHandler(void) {
     if (LPC_GPDMA->DMACIntTCStat & (1 << 0)) {					//flag de que el canal 0 termino de procesar
@@ -384,7 +388,7 @@ void DMA_IRQHandler(void) {
 
 void procesarBloqueDMA(void) {                                  //calcula nuevo valor de adc, actualiza los demas valores en base a eso, actualiza el dac
     volatile uint32_t *buf = (volatile uint32_t *)BUFFER_ADC_ADDR;		//puntero para recorrer y hacer el promedio
-    uint32_t suma = 0;                  
+    uint32_t suma = 0;
     uint32_t i;
     uint32_t dac_valor;
     uint8_t nuevo_duty;                                                   // nuevo duty medido y calculado
@@ -408,7 +412,7 @@ void procesarBloqueDMA(void) {                                  //calcula nuevo 
 
     if (error_luz <= 0) {											//si el error<=0, signfica mucha luz por lo tanto apago los leds
         nuevo_duty = 0;
-    } else if ((porcentaje_deseado > ERROR_ZONA_MUERTA) &&			//Si el error<2% de error de la zoma muerta, no enciende los leds, y para no anular valores deseados bajos 
+    } else if ((porcentaje_deseado > ERROR_ZONA_MUERTA) &&			//Si el error<2% de error de la zoma muerta, no enciende los leds, y para no anular valores deseados bajos
                (error_luz <= ERROR_ZONA_MUERTA)) {
         nuevo_duty = 0;
     } else if (error_luz >= 100) {									//si el error>= 100 significa poca luz por lo tanto enciendo
@@ -440,7 +444,7 @@ void EINT0_IRQHandler(void) {				//encargado del boton que activa o desactiva el
 }
 
 
-// ===== Funciones encargadas de detener y activar el sistema ===== 
+// ===== Funciones encargadas de detener y activar el sistema =====
 
 void sistema_start(void) {					//activa el sistema
     sistema_activo = 1;
@@ -521,11 +525,11 @@ void configUART1(void) {
 
     UART_PinConfig(UART_TX1_P0_15);
     UART_PinConfig(UART_RX1_P0_16);
-    UART_Init(UART_PC, &uartCfg);                   // powerup, calcula divisores, configura y limpia estados viejos    
+    UART_Init(UART_PC, &uartCfg);                   // powerup, calcula divisores, configura y limpia estados viejos
     UART_FIFOConfig(UART_PC, &fifoCfg);
     UART_TxEnable(UART_PC);
     UART_IntConfig(UART_PC, UART_INT_RBR, ENABLE);      //habilito int cuando hay dato recibido en la fifo rx
-    UART_IntConfig(UART_PC, UART_INT_RLS, ENABLE);      //habilito int por error o estado de linea 
+    UART_IntConfig(UART_PC, UART_INT_RLS, ENABLE);      //habilito int por error o estado de linea
     NVIC_SetPriority(UART1_IRQn, 0);
     NVIC_EnableIRQ(UART1_IRQn);
 }
@@ -534,16 +538,18 @@ void configUART1(void) {
 // ==== Para Recepcion ====
 
 void UART1_IRQHandler(void) {                           // para recepcion
-    uint32_t intId = UART_GetIntId(UART_PC);			//Id de la interrupcion del uart, lee el IIR 
+    uint32_t intId = UART_GetIntId(UART_PC);			//Id de la interrupcion del uart, lee el IIR
     uint32_t tipo_int;
     uint8_t estado;
     uint8_t dato;
     uint8_t leidos = 0;
 
-    if (intId & UART_IIR_INTSTAT_PEND) return;			// = 1 no hay int pendiente, = 0 si hay int pendiente 
+// Bloque encargado de interrupciones por erorres
 
-    tipo_int = intId & UART_IIR_INTID_MASK;             //se queda con los bits que le dicen la causa de la int     
-    estado = UART_GetLineStatus(UART_PC);               //lee el LSR, contiene flags 
+    if (intId & UART_IIR_INTSTAT_PEND) return;			// = 1 no hay int pendiente, = 0 si hay int pendiente
+
+    tipo_int = intId & UART_IIR_INTID_MASK;             //se queda con los bits que le dicen la causa de la int
+    estado = UART_GetLineStatus(UART_PC);               //lee el LSR, contiene flags
 
     if (tipo_int == UART_IIR_INTID_RLS) {				//si fue int de error de linea se limpia los buffer de rx si no habia comando para procesar
         if (!comando_listo) {							//y se limpia la FIFO en el while
@@ -552,7 +558,7 @@ void UART1_IRQHandler(void) {                           // para recepcion
         }
 
         while ((leidos < RX_BUFFER_SIZE) && (UART_Receive(UART_PC, &dato, 1, NONE_BLOCKING) == 1)) {	//se usa el NONE_BLOCKING para no bloquear
-            leidos++;																		//mientras haya datos en el FIFO, los limpia leyendolos 
+            leidos++;																		//mientras haya datos en el FIFO, los limpia leyendolos
         }
         return;
     }
@@ -563,11 +569,13 @@ void UART1_IRQHandler(void) {                           // para recepcion
             rx_buffer[0] = '\0';
         }
 
+// Bloque encargado de almacenar los caracteres
+
         while ((leidos < RX_BUFFER_SIZE) && (UART_Receive(UART_PC, &dato, 1, NONE_BLOCKING) == 1)) {		//limpia la FIFO si hubo error
             leidos++;
 
-            if (comando_listo) {			
-                continue;                               //para no agregar nuevos caracteres si ya hay un comanod listo para procesar 
+            if (comando_listo) {
+                continue;                               //para no agregar nuevos caracteres si ya hay un comanod listo para procesar
             }
 
             if (dato == '\r' || dato == '\n') {		//detecta el enter del teclado y activa la flag de comando listo
@@ -613,7 +621,7 @@ void UART_SendUInt(uint32_t num) {					//encargado de transformar los caracteres
         return;
     }
     while (num > 0 && i < 10) {
-        buf[i++] = (char)((num % 10) + '0');                // guarda los digitos de a 1 
+        buf[i++] = (char)((num % 10) + '0');                // guarda los digitos de a 1
         num /= 10;
     }
     for (j=i-1; j>=0; j--)								//encargado de enviar en orden correcto, por que el while los obtiene en orden al reves
@@ -632,7 +640,7 @@ void UART_SendInt(int32_t num) {						//encargado de enviar el signo del numero,
 
 // ==== Funciones para recibir por UART ====
 
-void UART_ProcesarComando(void) {                   //procesa comando recibido y responde ok y el valor o error 
+void UART_ProcesarComando(void) {                   //procesa comando recibido y responde ok y el valor o error
     char comando_local[RX_BUFFER_SIZE];         //buffer local
     uint8_t nuevo_valor;
     uint8_t i;
@@ -640,15 +648,15 @@ void UART_ProcesarComando(void) {                   //procesa comando recibido y
     NVIC_DisableIRQ(UART1_IRQn);				//se deshabilita la int para copiar el buffer por si llega un caracter de por medio y evitar error
     for (i=0; i< RX_BUFFER_SIZE; i++) {
         comando_local[i] = rx_buffer[i];
-        if (rx_buffer[i] == '\0') break;        //copia el comando 
+        if (rx_buffer[i] == '\0') break;        //copia el comando
     }
-    comando_local[RX_BUFFER_SIZE - 1] = '\0';	//x seguridad 
+    comando_local[RX_BUFFER_SIZE - 1] = '\0';	//x seguridad
     rx_buffer[0] = '\0';                        //limpio el buffer global
     rx_index = 0;
     comando_listo = 0;
-    NVIC_EnableIRQ(UART1_IRQn);                 //habilito de nuevo para recibir 
+    NVIC_EnableIRQ(UART1_IRQn);                 //habilito de nuevo para recibir
 
-    enviar_estado = 0;							//limpio flag del systick para q no se mande info mientras proceso 
+    enviar_estado = 0;							//limpio flag del systick para q no se mande info mientras proceso
     contador_2_segundos = 0;					//reseteo contador para q arranque de nuevo una vez cambiados los valores
 
     nuevo_valor = convertirTextoAPorcentaje(comando_local);		//convierte el codigo ASCII en un entero
